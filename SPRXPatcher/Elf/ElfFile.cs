@@ -80,32 +80,38 @@ public class ElfFile {
     public byte[] Write(BigBinaryWriter bw) {
         this.Header.Write(bw); // We'll go back and update the header later
 
+        // Keep PHT at its original offset (right after ELF header). Stock PS3
+        // appldr (non-CFW DEX, e.g. system 357 in DEX mode) rejects ELFs whose
+        // PHT is relocated past the section data — see error 0x80010017.
+        var originalPhtOffset = this.Header.ProgramHeaderOffset;
+        var phtSize = (ulong) (this.Header.ProgramHeaderCount * 0x38);
+        var phtEnd = originalPhtOffset + phtSize;
         {
-            // We're gonna relocate the program headers to the end of the file
-            var programHeadersOffset = this.Header.ProgramHeaderOffset;
-            var programHeadersSize = this.Header.ProgramHeaderCount * 0x38;
-            var programHeadersEnd = programHeadersOffset + (ulong) programHeadersSize;
-
-            var currentOffset = bw.BaseStream.Position;
-            var zeroes = new byte[programHeadersEnd - (ulong) currentOffset];
-            Array.Fill(zeroes, (byte) 0);
-            bw.Write(zeroes);
+            var currentOffset = (ulong) bw.BaseStream.Position;
+            if (phtEnd > currentOffset) {
+                var zeroes = new byte[phtEnd - currentOffset];
+                Array.Fill(zeroes, (byte) 0);
+                bw.Write(zeroes);
+            }
         }
 
         // Write the sections
         foreach (var sectionHeader in this.SectionHeaders) this.WriteSection(sectionHeader, bw);
 
-        // Seek to end
-        bw.BaseStream.Seek(0, SeekOrigin.End);
-        this.SeekToAlignment(bw, 0x1000);
+        // Place the shellcode inside the existing RX PT_LOAD's tail gap, so we
+        // don't have to append a new (misaligned, VA!=PA) LOAD segment that
+        // stock appldr would reject. The gap between the RX LOAD and the next
+        // LOAD is ~0xbb18 bytes in both file and VA space — shellcode is tiny.
+        var rxLoad = this.ProgramHeaders.First(p =>
+            p.Type == ElfProgramHeader.ProgramType.Load &&
+            (p.Flags & ElfProgramHeader.ProgramFlags.X) != 0);
+        var nextLoad = this.ProgramHeaders
+            .Where(p => p.Type == ElfProgramHeader.ProgramType.Load && p.Offset > rxLoad.Offset && p.FileSize > 0)
+            .OrderBy(p => p.Offset)
+            .FirstOrDefault();
 
-        var customSectionOffset = (ulong) bw.BaseStream.Position;
-
-        // Find free space for our shellcode in virtual memory
-        // This is kinda naive but it should work(?)
-        var highestVa = this.SectionHeaders.Max(s => s.VirtualAddress + s.FileSize);
-        //var customSectionVa = this.Align(highestVa, 0x1000);
-        var customSectionVa = 0x13370000u; // HACK HACK HACK HACK HACK
+        var customSectionOffset = this.Align(rxLoad.Offset + rxLoad.FileSize, 4);
+        var customSectionVa = this.Align(rxLoad.VirtualAddress + rxLoad.FileSize, 4);
         Console.WriteLine($"Custom section VA: 0x{customSectionVa:X}, file offset: 0x{customSectionOffset:X}");
 
         var creator = new ShellcodeCreator();
@@ -115,44 +121,34 @@ public class ElfFile {
             this.entrypointAddress,
             (uint) customSectionVa
         );
+
+        var shellcodeEndOffset = customSectionOffset + (ulong) shellcode.Length;
+        if (nextLoad != null && shellcodeEndOffset > nextLoad.Offset)
+            throw new InvalidOperationException(
+                $"Shellcode (0x{shellcode.Length:X} bytes) does not fit in RX LOAD tail gap before next LOAD at 0x{nextLoad.Offset:X}");
+
+        bw.BaseStream.Seek((long) customSectionOffset, SeekOrigin.Begin);
         bw.Write(shellcode);
-        this.SeekToAlignment(bw, 0x1000);
 
-        var customSection = new ElfSectionHeader {
-            NameOffset = 0,
-            Type = ElfSectionHeader.SectionType.Progbits,
-            Flags = ElfSectionHeader.SectionFlags.Alloc | ElfSectionHeader.SectionFlags.ExecInstr,
-            VirtualAddress = customSectionVa,
-            PhysicalAddress = customSectionOffset,
-            FileSize = (ulong) shellcode.Length,
-            Link = 0,
-            Info = 0,
-            Alignment = 1,
-            EntrySize = 0
-        };
-        this.SectionHeaders.Add(customSection);
-        var customProgramHeader = new ElfProgramHeader {
-            Type = ElfProgramHeader.ProgramType.Load,
-            Flags = ElfProgramHeader.ProgramFlags.R | ElfProgramHeader.ProgramFlags.X,
-            Offset = customSectionOffset,
-            VirtualAddress = customSection.VirtualAddress,
-            PhysicalAddress = customSection.PhysicalAddress,
-            FileSize = customSection.FileSize,
-            MemorySize = customSection.FileSize,
-            Alignment = 0x1000
-        };
-        this.ProgramHeaders.Add(customProgramHeader);
+        // Extend the RX PT_LOAD to cover the shellcode we just wrote in-place.
+        var newRxEnd = shellcodeEndOffset;
+        var growth = newRxEnd - (rxLoad.Offset + rxLoad.FileSize);
+        rxLoad.FileSize += growth;
+        rxLoad.MemorySize += growth;
 
-        // Write the section headers
+        // Section header table goes at end of file. Don't add a custom section
+        // header — PS3 PPU ELFs don't need it and skipping it keeps SHT count
+        // unchanged.
+        bw.BaseStream.Seek(0, SeekOrigin.End);
         var sectionHeaderOffset = bw.BaseStream.Position;
         foreach (var sectionHeader in this.SectionHeaders) sectionHeader.Write(bw);
         this.Header.SectionHeaderOffset = (ulong) sectionHeaderOffset;
         this.Header.SectionHeaderCount = (ushort) this.SectionHeaders.Count;
 
-        // Finally, write the program headers
-        var programHeaderOffset = bw.BaseStream.Position;
+        // Rewrite the PHT in-place at its original offset (count is unchanged).
+        bw.BaseStream.Seek((long) originalPhtOffset, SeekOrigin.Begin);
         foreach (var programHeader in this.ProgramHeaders) programHeader.Write(bw);
-        this.Header.ProgramHeaderOffset = (ulong) programHeaderOffset;
+        this.Header.ProgramHeaderOffset = originalPhtOffset;
         this.Header.ProgramHeaderCount = (ushort) this.ProgramHeaders.Count;
 
         // Update the new entrypoint
